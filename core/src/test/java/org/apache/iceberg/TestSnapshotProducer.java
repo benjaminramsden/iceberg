@@ -23,6 +23,10 @@ import static org.apache.iceberg.avro.AvroTestHelpers.readAvroCodec;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import java.io.File;
 import java.io.IOException;
@@ -30,6 +34,7 @@ import java.nio.file.Paths;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -38,6 +43,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
+import org.apache.iceberg.util.ThreadPools;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -94,6 +100,61 @@ public class TestSnapshotProducer extends TestBase {
       int workerPoolSize, int fileCount, int expectedManifestWriterCount, String errMsg) {
     int writerCount = SnapshotProducer.manifestWriterCount(workerPoolSize, fileCount);
     assertThat(writerCount).as(errMsg).isEqualTo(expectedManifestWriterCount);
+  }
+
+  @TestTemplate
+  void dataManifestWritesUseConfiguredExecutor() {
+    ExecutorService executor =
+        spy(
+            Executors.unconfigurableExecutorService(
+                ThreadPools.newFixedThreadPool("manifest-writer-test", 1)));
+    try {
+      BaseRowDelta producer = new BaseRowDelta(table.name(), table.ops());
+      producer.writeManifestsWith(executor, 1);
+      int fileCount = 3 * SnapshotProducer.MIN_FILE_GROUP_SIZE;
+      List<ManifestFile> manifests =
+          producer.writeDataManifests(Collections.nCopies(fileCount, FILE_A), SPEC);
+
+      verify(executor).submit(any(Runnable.class));
+      assertThat(manifests)
+          .singleElement()
+          .extracting(ManifestFile::content, ManifestFile::addedFilesCount)
+          .containsExactly(ManifestContent.DATA, fileCount);
+      assertThat(executor.isShutdown()).isFalse();
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @TestTemplate
+  void deleteManifestWritesUseConfiguredExecutor() {
+    assumeThat(formatVersion).isGreaterThanOrEqualTo(2);
+
+    int poolSize = 2;
+    ExecutorService executor =
+        spy(
+            Executors.unconfigurableExecutorService(
+                ThreadPools.newFixedThreadPool("manifest-writer-test", poolSize)));
+    try {
+      BaseRowDelta producer = new BaseRowDelta(table.name(), table.ops());
+      producer.writeManifestsWith(executor, poolSize);
+      int fileCount = 3 * SnapshotProducer.MIN_FILE_GROUP_SIZE;
+      List<ManifestFile> manifests =
+          producer.writeDeleteManifests(
+              Collections.nCopies(fileCount, FILE_A_EQUALITY_DELETES), SPEC);
+
+      verify(executor, times(poolSize)).submit(any(Runnable.class));
+      assertThat(manifests)
+          .hasSize(poolSize)
+          .allSatisfy(
+              manifest -> {
+                assertThat(manifest.content()).isEqualTo(ManifestContent.DELETES);
+                assertThat(manifest.addedFilesCount()).isEqualTo(fileCount / poolSize);
+              });
+      assertThat(executor.isShutdown()).isFalse();
+    } finally {
+      executor.shutdownNow();
+    }
   }
 
   @TestTemplate
